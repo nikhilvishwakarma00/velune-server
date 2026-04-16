@@ -1,0 +1,14 @@
+
+{
+    "name": "velune-server",
+    "version": "1.0.0",
+    "description": "WebSocket sigaling server for Velune Music Together",
+    "main": "server.js",
+    "scripts": {
+        "start": "node server.js"
+    },
+    "dependencies": {
+        "ws": "^8.20.0"
+    }
+
+}
