@@ -1,40 +1,47 @@
 const http = require('http');
 const WebSocket = require('ws');
 
-// In-memory database to store active sessions
 const activeSessions = {};
 
 const server = http.createServer((req, res) => {
-    // Add CORS headers so Android doesn't block it
+    // 1. CORS & Safety Headers (Prevents Android from blocking the request)
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
     res.setHeader('Content-Type', 'application/json');
 
-    // 1. Health Check
-    if (req.method === 'GET' && req.url === '/') {
+    // Instantly approve OPTIONS preflight requests
+    if (req.method === 'OPTIONS') {
         res.writeHead(200);
-        res.end(JSON.stringify({ status: "Velune Server is online!" }));
+        res.end();
         return;
     }
 
-    // Helper to read JSON body
+    console.log(`\n[INCOMING REQUEST] ${req.method} ${req.url}`);
+
+    // 2. Health Check (Use this URL in your browser to wake the server up!)
+    if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200);
+        res.end(JSON.stringify({ status: "Velune Server is awake and ready!" }));
+        return;
+    }
+
     let body = '';
     req.on('data', chunk => body += chunk.toString());
     req.on('end', () => {
         let parsedBody = {};
         if (body) {
-            try { parsedBody = JSON.parse(body); } catch (e) {}
+            try { parsedBody = JSON.parse(body); } catch (e) { console.log("Failed to parse JSON body"); }
         }
 
-        // 2. GUEST ROUTE: Resolve the 6-digit code
-        // IMPORTANT: Check 'resolve' BEFORE the create route to avoid collision!
-        if (req.method === 'POST' && req.url.includes('/v1/together/sessions/resolve')) {
+        // 3. GUEST ROUTE
+        if (req.method === 'POST' && req.url === '/v1/together/sessions/resolve') {
             const requestedCode = parsedBody.code;
-            
-            // Look up the code in our database
             const sessionCodeKey = Object.keys(activeSessions).find(k => activeSessions[k].code === requestedCode);
             const session = activeSessions[sessionCodeKey];
 
             if (session) {
-                // Success! Send the exact JSON 'TogetherOnlineResolveResponse' expects
+                console.log(`[SUCCESS] Guest joined session ${requestedCode}`);
                 res.writeHead(200);
                 res.end(JSON.stringify({
                     sessionId: session.sessionId,
@@ -43,37 +50,33 @@ const server = http.createServer((req, res) => {
                     settings: session.settings
                 }));
             } else {
+                console.log(`[FAILED] Guest tried to join invalid code: ${requestedCode}`);
                 res.writeHead(404);
                 res.end(JSON.stringify({ error: "Session not found" }));
             }
             return;
         }
 
-        // 3. HOST ROUTE: Create a new session
-        if (req.method === 'POST' && req.url.includes('/v1/together/sessions')) {
+        // 4. HOST ROUTE
+        if (req.method === 'POST' && req.url === '/v1/together/sessions') {
             const randomCode = Math.floor(100000 + Math.random() * 900000).toString();
             
-            // Extract settings from the Host's request
-            const roomSettings = parsedBody.settings || {
-                allowGuestsToAddTracks: true,
-                allowGuestsToControlPlayback: false,
-                requireHostApprovalToJoin: false
-            };
+            // Generate the secure wss:// URL based on Render's host headers
+            const secureWsUrl = "wss://" + req.headers.host + "/v1/together/ws";
 
-            // Save the room to our database
             activeSessions[randomCode] = {
                 sessionId: "sess-" + randomCode,
                 code: randomCode,
                 hostKey: "host-key-" + Date.now(),
                 guestKey: "guest-key-" + Date.now(),
-                wsUrl: "wss://" + req.headers.host + "/v1/together/ws",
-                settings: roomSettings,
+                wsUrl: secureWsUrl,
+                settings: parsedBody.settings || { allowGuestsToAddTracks: true, allowGuestsToControlPlayback: false, requireHostApprovalToJoin: false },
                 clients: new Set(),
-                currentState: { // The empty state Velune expects
+                currentState: {
                     sessionId: "sess-" + randomCode,
                     hostId: "host-" + Date.now(),
                     participants: [],
-                    settings: roomSettings,
+                    settings: parsedBody.settings || {},
                     queue: [],
                     queueHash: "",
                     currentIndex: 0,
@@ -85,7 +88,7 @@ const server = http.createServer((req, res) => {
                 }
             };
 
-            // Success! Send the exact JSON 'TogetherOnlineCreateSessionResponse' expects
+            console.log(`[SUCCESS] Host created room with code: ${randomCode}`);
             res.writeHead(200);
             res.end(JSON.stringify({
                 sessionId: activeSessions[randomCode].sessionId,
@@ -97,40 +100,36 @@ const server = http.createServer((req, res) => {
             }));
             return;
         }
+
+        // 5. CATCH-ALL (If the app requests a weird URL, it won't timeout anymore!)
+        console.log(`[WARNING] Route not found: ${req.url}`);
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: "Route not found" }));
     });
 });
 
-// 4. WEBSOCKET SERVER
+// WEBSOCKET SERVER
 const wss = new WebSocket.Server({ server, path: '/v1/together/ws' });
 
 wss.on('connection', function connection(ws, req) {
-    console.log("A client connected! Waiting for ClientHello...");
-    
-    // We store the room here once the client introduces themselves
     let assignedRoom = null;
 
     ws.on('message', function incoming(message) {
         const parsedMessage = JSON.parse(message.toString());
 
-        // --- THE MAGIC HANDSHAKE ---
-        // Velune connects and immediately says "client_hello". We MUST reply to this!
+        // The Handshake
         if (parsedMessage.type === "client_hello") {
-            const requestedSessionId = parsedMessage.sessionId;
-            
-            // Find the room they are asking for
-            const roomCode = Object.keys(activeSessions).find(code => activeSessions[code].sessionId === requestedSessionId);
+            const roomCode = Object.keys(activeSessions).find(code => activeSessions[code].sessionId === parsedMessage.sessionId);
             assignedRoom = activeSessions[roomCode];
 
             if (!assignedRoom) {
-                console.log("Room not found. Closing connection.");
                 ws.close();
                 return;
             }
 
             assignedRoom.clients.add(ws);
-            console.log(`User ${parsedMessage.displayName} joined room ${roomCode}!`);
+            console.log(`[WEBSOCKET] User joined room ${roomCode}!`);
 
-            // 1. Send ServerWelcome
             ws.send(JSON.stringify({
                 type: "server_welcome",
                 protocolVersion: 1,
@@ -141,16 +140,14 @@ wss.on('connection', function connection(ws, req) {
                 settings: assignedRoom.settings
             }));
 
-            // 2. Send RoomStateMessage immediately after
             ws.send(JSON.stringify({
                 type: "room_state",
                 state: assignedRoom.currentState 
             }));
-            return; // Handshake complete!
+            return; 
         }
 
-        // --- NORMAL MESSAGE ROUTER ---
-        // If it's a Play/Pause/Add Track command, broadcast it to everyone else
+        // Broadcast music controls
         if (assignedRoom) {
             assignedRoom.clients.forEach(function each(client) {
                 if (client !== ws && client.readyState === WebSocket.OPEN) {
@@ -163,8 +160,13 @@ wss.on('connection', function connection(ws, req) {
     ws.on('close', () => {
         if (assignedRoom) {
             assignedRoom.clients.delete(ws);
-            console.log(`A user left.`);
+            console.log(`[WEBSOCKET] A user disconnected.`);
         }
     });
+});
+
+const port = process.env.PORT || 8080;
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Velune Backend listening on port ${port}`);
 });
 
