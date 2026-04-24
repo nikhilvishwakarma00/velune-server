@@ -19,12 +19,13 @@ const server = http.createServer((req, res) => {
 
     console.log(`\n[INCOMING REQUEST] ${req.method} ${req.url}`);
 
-    // 2. Health Check (Use this URL in your browser to wake the server up!)
-    if (req.method === 'GET' && req.url === '/') {
+        // 2. Health Check (Accepts both browser GETs and Robot HEADs)
+    if ((req.method === 'GET' || req.method === 'HEAD') && req.url === '/') {
         res.writeHead(200);
         res.end(JSON.stringify({ status: "Velune Server is awake and ready!" }));
         return;
     }
+    
 
     let body = '';
     req.on('data', chunk => body += chunk.toString());
