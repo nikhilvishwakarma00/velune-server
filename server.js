@@ -104,62 +104,67 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server, path: '/v1/together/ws' });
 
 wss.on('connection', function connection(ws, req) {
-    console.log("A client is attempting to connect to WebSockets...");
+    console.log("A client connected! Waiting for ClientHello...");
     
-    // Grab the session ID from the URL (e.g., ?sid=sess-402599)
-    const urlParams = new URLSearchParams(req.url.split('?')[1]);
-    const sessionId = urlParams.get('sid');
-    
-    // Find the room
-    const roomCode = Object.keys(activeSessions).find(code => activeSessions[code].sessionId === sessionId);
-    const room = activeSessions[roomCode];
+    // We store the room here once the client introduces themselves
+    let assignedRoom = null;
 
-    if (!room) {
-        console.log("Room not found, closing connection.");
-        ws.close();
-        return;
-    }
-
-    room.clients.add(ws);
-    console.log(`User joined room ${roomCode}!`);
-
-    // --- THE MAGIC HANDSHAKE ---
-    // 1. Send ServerWelcome
-    const welcomeMessage = {
-        type: "server_welcome",
-        protocolVersion: 1,
-        sessionId: room.sessionId,
-        participantId: "guest-" + Math.floor(Math.random() * 10000),
-        role: "GUEST", // Or "HOST" if you want to verify keys later
-        isPending: false,
-        settings: room.settings
-    };
-    ws.send(JSON.stringify(welcomeMessage));
-
-    // 2. Send RoomStateMessage immediately after
-    const stateMessage = {
-        type: "room_state",
-        state: room.currentState 
-    };
-    ws.send(JSON.stringify(stateMessage));
-
-    // --- MESSAGE ROUTER ---
     ws.on('message', function incoming(message) {
-        // Broadcast incoming actions to everyone else in this specific room
-        room.clients.forEach(function each(client) {
-            if (client !== ws && client.readyState === WebSocket.OPEN) {
-                client.send(message.toString());
+        const parsedMessage = JSON.parse(message.toString());
+
+        // --- THE MAGIC HANDSHAKE ---
+        // Velune connects and immediately says "client_hello". We MUST reply to this!
+        if (parsedMessage.type === "client_hello") {
+            const requestedSessionId = parsedMessage.sessionId;
+            
+            // Find the room they are asking for
+            const roomCode = Object.keys(activeSessions).find(code => activeSessions[code].sessionId === requestedSessionId);
+            assignedRoom = activeSessions[roomCode];
+
+            if (!assignedRoom) {
+                console.log("Room not found. Closing connection.");
+                ws.close();
+                return;
             }
-        });
+
+            assignedRoom.clients.add(ws);
+            console.log(`User ${parsedMessage.displayName} joined room ${roomCode}!`);
+
+            // 1. Send ServerWelcome
+            ws.send(JSON.stringify({
+                type: "server_welcome",
+                protocolVersion: 1,
+                sessionId: assignedRoom.sessionId,
+                participantId: parsedMessage.clientId,
+                role: "GUEST", 
+                isPending: false,
+                settings: assignedRoom.settings
+            }));
+
+            // 2. Send RoomStateMessage immediately after
+            ws.send(JSON.stringify({
+                type: "room_state",
+                state: assignedRoom.currentState 
+            }));
+            return; // Handshake complete!
+        }
+
+        // --- NORMAL MESSAGE ROUTER ---
+        // If it's a Play/Pause/Add Track command, broadcast it to everyone else
+        if (assignedRoom) {
+            assignedRoom.clients.forEach(function each(client) {
+                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                    client.send(message.toString());
+                }
+            });
+        }
     });
 
     ws.on('close', () => {
-        room.clients.delete(ws);
-        console.log(`User left room ${roomCode}.`);
+        if (assignedRoom) {
+            assignedRoom.clients.delete(ws);
+            console.log(`A user left.`);
+        }
     });
 });
 
-const port = process.env.PORT || 8080;
-server.listen(port, () => {
-  console.log(`Velune Backend listening on port ${port}`);
-});
